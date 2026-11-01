@@ -1,0 +1,7 @@
+*.log
+*.local.txt
+.DS_Store
+__pycache__/
+*.pyc
+venvs/
+models/
