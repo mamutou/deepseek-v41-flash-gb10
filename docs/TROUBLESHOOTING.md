@@ -50,6 +50,25 @@ model=DSV4 num_heads=64 topk=128 page_block_size=64 topk_extra=512
 
 **处理**：并发 ≤6（5、6、7 都验证可用）。
 
+## 长提示词一发就把服务打挂
+
+```
+tvm.error.InternalError: Check failed: (ok) is false: Unsupported sparse-MLA prefill configuration:
+model=DSV4 num_heads=64 topk=128 page_block_size=64 topk_extra=512 extra_page_block_size=128
+[2026-11-01 20:54:36] SIGQUIT received. signum=None, frame=None. It usually means one child failed.
+```
+
+**真因**：`index_topk=512`，超过它的序列切到稀疏 MLA prefill，而 `flashinfer` 的
+`_sparse_mla_sm120` 不支持当前池配置（`page_block_size=64` + `topk_extra=512` +
+`extra_page_block_size=128`）。**进程会直接死，不是返回错误码**，客户端看到的是
+`RemoteDisconnected`。
+
+**实测**：几十 token 正常（dense 路径）、~700 token 崩、~2400 token 崩。阈值很可能就在
+`index_topk=512` 附近，用 `scripts/bisect_prefill.py` 二分确认。
+
+**处理**：目前只能避开长输入（短提问 + 长输出），或去改内核路径（`--page-size`、attention backend）。
+同一报错也是 `--max-running-requests 8` 起不来的原因。
+
 ## 输出里有 `**北京_（北京是北京市的简称…` 这种脏串，或者复读
 
 **真因**：`skip_special_tokens=True`。这份 tokenizer 带 826 个含 `▁` 的 added token，

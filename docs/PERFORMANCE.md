@@ -34,17 +34,19 @@ LPDDR5X 共享给 CPU 与 GPU），无第二台机器参与。
 **单请求延迟最优**：`CTX=32768 SLOTS=40 FRAC=0.90 MEM=0.95 MAXREQ=6 CPUQ=1600%`（4.22 tok/s）
 **聚合吞吐最优**：`CTX=32768 SLOTS=48 FRAC=0.88 MEM=0.96 MAXREQ=6`（8.27 tok/s @6 路）
 
-## 3. 三个硬边界（不是调参能让开的）
+## 3. 四个硬边界（不是调参能让开的）
 
-### 3.1 上下文上限 32K
+### 3.1 KV 池上限 32K —— 但可用输入长度远小于此
 
-KV 约 **1.15 MB/token**（40 层 MLA + c4/c128 压缩池）：
+KV 约 **1.15 MB/token**（40 层 MLA + c4/c128 压缩池），池子可以开到 32K：
 
 | 上下文 | KV 需求 | 能否 |
 |---|---|---|
 | 32K | ~38 GB | ✅（`MEM=0.95` 下 KV 余 37.7 GB）|
 | 64K | ~73 GB | ❌ 加上权重的 85 GB 超出 121.63 GiB |
 | 128K+ | — | ❌ 需要双 Spark |
+
+**但这只是「池子」，不是「能吃的输入长度」。** 见 3.4：长提示词会直接打挂服务。
 
 ### 3.2 GPU 槽位上限 48–56
 
@@ -65,6 +67,35 @@ model=DSV4 num_heads=64 topk=128 page_block_size=64 topk_extra=512
 ```
 
 5–7 都能跑，8 必崩。
+
+### 3.4 prefill 输入长度：~512 token 以上走稀疏路径，直接崩服务
+
+`text_config.index_topk = 512`。序列超过这个长度就切到稀疏 MLA prefill，
+而 `flashinfer.mla._sparse_mla_sm120` 拒绝当前池配置：
+
+```
+tvm.error.InternalError: Check failed: (ok) is false: Unsupported sparse-MLA prefill configuration:
+model=DSV4 num_heads=64 topk=128 page_block_size=64 topk_extra=512 extra_page_block_size=128
+  at sglang/kernels/ops/attention/flash_mla_sm120.py::_flash_mla_sm120_prefill
+```
+
+**后果不是 500，是整个 scheduler 抛异常 → `SIGQUIT received` → 进程树被 kill。**
+
+| 提示词长度 | 结果 |
+|---|---|
+| 几十 token（本仓库所有基准/成色测试）| 正常，走 dense 路径 |
+| ~700 token | 崩 |
+| ~2400 token | 崩 |
+
+所以「32K 上下文」目前只能理解为**KV 池容量**。实际可用输入长度很可能在 512 token 附近
+（`index_topk` 阈值），需用 `scripts/bisect_prefill.py` 在自己的环境上确认：
+
+```bash
+python3 scripts/bisect_prefill.py 256 8192   # 命中即停，重启服务后从更小值继续二分
+```
+
+可能的解法（未验证，留给后续）：换 `--page-size` 退出 `page_block_size=64` 这个组合、
+换 attention backend、或等 flashinfer 上游支持该配置。
 
 ## 4. 一个 token 的时间去哪了
 
